@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -234,9 +235,16 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     ASSERT(is_new);
 
+    // Preloaded pipelines read no guest state, so the driver compilation can always run on the
+    // worker threads; WarmUp() waits for all of them before the game starts.
+    const bool defer_build = compile_workers != nullptr;
     it.value() = std::make_unique<GraphicsPipeline>(
         instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-        runtime_infos, fetch_shader, modules, sdata, true);
+        runtime_infos, fetch_shader, modules, sdata, true, defer_build);
+    if (defer_build) {
+        GraphicsPipeline* pipeline = it.value().get();
+        compile_workers->Submit([pipeline] { pipeline->Build(); });
+    }
 
     infos.fill(nullptr);
     modules.fill(nullptr);
@@ -339,6 +347,7 @@ void PipelineCache::WarmUp() {
 
     u32 num_pipelines{};
     u32 num_total_pipelines{};
+    const auto warmup_start = std::chrono::steady_clock::now();
 
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
@@ -368,7 +377,13 @@ void PipelineCache::WarmUp() {
             }
         });
 
-    LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    if (compile_workers) {
+        compile_workers->WaitIdle();
+    }
+    const auto warmup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - warmup_start)
+                               .count();
+    LOG_INFO(Render, "Preloaded {} pipelines in {} ms", num_pipelines, warmup_ms);
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);

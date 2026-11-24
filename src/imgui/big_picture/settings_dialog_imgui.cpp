@@ -94,6 +94,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
         connectedNetworkSetting = EmulatorSettings.IsConnectedToNetwork();
         pipelineCacheEnabledSetting = EmulatorSettings.IsPipelineCacheEnabled();
         pipelineCacheArchiveSetting = EmulatorSettings.IsPipelineCacheArchived();
+        asyncPipelineCompileSetting = EmulatorSettings.IsAsyncPipelineCompile();
         extraDmemSetting = EmulatorSettings.GetExtraDmemInMBytes();
         vblankFrequencySetting = EmulatorSettings.GetVblankFrequency();
     }
@@ -151,6 +152,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
         EmulatorSettings.SetConnectedToNetwork(connectedNetworkSetting, true);
         EmulatorSettings.SetPipelineCacheEnabled(pipelineCacheEnabledSetting, true);
         EmulatorSettings.SetPipelineCacheArchived(pipelineCacheArchiveSetting, true);
+        EmulatorSettings.SetAsyncPipelineCompile(asyncPipelineCompileSetting, true);
         EmulatorSettings.SetExtraDmemInMBytes(extraDmemSetting, true);
         EmulatorSettings.SetVblankFrequency(vblankFrequencySetting, true);
     }
@@ -802,6 +804,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                 AddSettingCheckbox("Compress Shader Cache to Zip File",
                                    pipelineCacheArchiveSetting);
             }
+            AddSettingCheckbox("Async Shader Compilation (Reduces Stutter)",
+                               asyncPipelineCompileSetting);
 
             ImGui::EndTable();
         }

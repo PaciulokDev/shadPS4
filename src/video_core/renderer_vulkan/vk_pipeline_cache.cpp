@@ -7,6 +7,7 @@
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -369,6 +370,17 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .fast_shader_math = EmulatorSettings.IsFastShaderMath(),
         .support_bda = instance_.IsBufferDeviceAddressSupported(),
     };
+
+    async_compile = EmulatorSettings.IsAsyncPipelineCompile();
+    if (async_compile || EmulatorSettings.IsPipelineCacheEnabled()) {
+        // Leave plenty of cores for the emulated CPU threads.
+        const u32 hw_threads = std::max(std::thread::hardware_concurrency(), 1U);
+        const u32 num_workers = std::clamp(hw_threads / 3, 2U, 6U);
+        compile_workers = std::make_unique<PipelineCompileWorkers>(num_workers);
+        LOG_INFO(Render_Vulkan, "Pipeline compile workers: {}, async compilation: {}", num_workers,
+                 async_compile);
+    }
+
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
@@ -377,7 +389,88 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     pipeline_cache = std::move(cache);
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    // Finish all in-flight pipeline builds before the pipelines are destroyed.
+    compile_workers.reset();
+}
+
+PipelineCompileWorkers::PipelineCompileWorkers(u32 num_threads) {
+    threads.reserve(num_threads);
+    for (u32 i = 0; i < num_threads; ++i) {
+        threads.emplace_back([this](std::stop_token stoken) { WorkerLoop(stoken); });
+    }
+}
+
+PipelineCompileWorkers::~PipelineCompileWorkers() {
+    WaitIdle();
+    for (auto& thread : threads) {
+        thread.request_stop();
+    }
+    job_cv.notify_all();
+    threads.clear(); // joins
+}
+
+void PipelineCompileWorkers::Submit(std::function<void()>&& job) {
+    {
+        std::scoped_lock lk{mutex};
+        jobs.emplace_back(std::move(job));
+        ++num_pending;
+    }
+    job_cv.notify_one();
+}
+
+void PipelineCompileWorkers::WaitIdle() {
+    std::unique_lock lk{mutex};
+    idle_cv.wait(lk, [this] { return num_pending == 0; });
+}
+
+void PipelineCompileWorkers::WorkerLoop(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:PipelineCompile");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    while (true) {
+        std::function<void()> job;
+        {
+            std::unique_lock lk{mutex};
+            if (!job_cv.wait(lk, stoken, [this] { return !jobs.empty(); })) {
+                return; // stop requested and nothing left to do
+            }
+            job = std::move(jobs.front());
+            jobs.pop_front();
+        }
+        job();
+        {
+            std::scoped_lock lk{mutex};
+            if (--num_pending == 0) {
+                idle_cv.notify_all();
+            }
+        }
+    }
+}
+
+bool PipelineCache::CanSkipDrawWhileCompiling() const {
+    // Skipping a draw only loses its color/depth output for a few frames. Shaders that write
+    // to memory (storage buffers/images, GDS) may feed game logic or later passes, so those
+    // pipelines are always compiled synchronously.
+    for (const auto* info : infos) {
+        if (!info) {
+            continue;
+        }
+        if (info->has_storage_images) {
+            return false;
+        }
+        for (const auto& buffer : info->buffers) {
+            if (buffer.is_written) {
+                return false;
+            }
+        }
+        for (const auto& image : info->images) {
+            if (image.is_written) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;
@@ -389,10 +482,16 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
+        const bool defer_build = async_compile && compile_workers && CanSkipDrawWhileCompiling();
+
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-            runtime_infos, fetch_shader, modules, sdata, false);
+            runtime_infos, fetch_shader, modules, sdata, false, defer_build);
+        if (defer_build) {
+            GraphicsPipeline* pipeline = it.value().get();
+            compile_workers->Submit([pipeline] { pipeline->Build(); });
+        }
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -406,7 +505,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             }
         }
     }
-    return it->second.get();
+    const GraphicsPipeline* pipeline = it->second.get();
+    if (!pipeline->IsReady()) {
+        // Still compiling on a worker thread: skip this draw instead of stalling the GPU thread.
+        return nullptr;
+    }
+    return pipeline;
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
@@ -765,6 +869,9 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
                 new_module = m.module;
             }
         }
+    }
+    if (compile_workers) {
+        compile_workers->WaitIdle();
     }
     if (module_related_pipelines.contains(module)) {
         auto& pipeline_keys = module_related_pipelines[module];

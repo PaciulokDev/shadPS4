@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <atomic>
+#include <string>
+
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
 
@@ -91,8 +94,20 @@ public:
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      const Shader::Gcn::FetchShaderData* fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading);
+                     bool preloading, bool defer_build = false);
     ~GraphicsPipeline();
+
+    /// Creates the Vulkan pipeline object. Called from the constructor unless the build was
+    /// deferred, in which case it may be called from any thread exactly once.
+    void Build();
+
+    /// Returns true once the Vulkan pipeline object has been created.
+    [[nodiscard]] bool IsReady() const noexcept {
+        return ready.load(std::memory_order_acquire);
+    }
+
+    /// Blocks until the Vulkan pipeline object has been created.
+    void WaitReady() const;
 
     const Shader::Gcn::FetchShaderData& GetFetchShader() const noexcept {
         return fetch_shader;
@@ -114,7 +129,16 @@ private:
 
 private:
     GraphicsPipelineKey key;
+    vk::PipelineCache vk_pipeline_cache;
     Shader::Gcn::FetchShaderData fetch_shader{};
+
+    // State captured on the GPU thread and consumed by Build().
+    SerializationSupport build_data{};
+    std::array<vk::ShaderModule, MaxShaderStages> stage_modules{};
+    u32 present_stage_mask{};
+    bool emulate_clip_distance{};
+    std::string debug_name;
+    std::atomic<bool> ready{false};
 };
 
 struct ClipDistanceShaderKey {

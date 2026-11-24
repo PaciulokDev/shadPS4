@@ -3,7 +3,14 @@
 
 #pragma once
 
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <variant>
+#include <vector>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
@@ -64,6 +71,37 @@ struct Program {
     }
 };
 
+/// Small pool of threads used to create Vulkan pipeline objects off the GPU thread.
+/// Used to compile pipelines asynchronously during gameplay and to parallelize the
+/// pipeline cache warm-up when a game starts.
+class PipelineCompileWorkers {
+public:
+    explicit PipelineCompileWorkers(u32 num_threads);
+    ~PipelineCompileWorkers();
+
+    PipelineCompileWorkers(const PipelineCompileWorkers&) = delete;
+    PipelineCompileWorkers& operator=(const PipelineCompileWorkers&) = delete;
+
+    void Submit(std::function<void()>&& job);
+
+    /// Blocks until every submitted job has finished.
+    void WaitIdle();
+
+    [[nodiscard]] u32 NumThreads() const noexcept {
+        return static_cast<u32>(threads.size());
+    }
+
+private:
+    void WorkerLoop(std::stop_token stoken);
+
+    std::mutex mutex;
+    std::condition_variable_any job_cv;
+    std::condition_variable idle_cv;
+    std::deque<std::function<void()>> jobs;
+    u32 num_pending{};
+    std::vector<std::jthread> threads;
+};
+
 struct DrawIndirectParams {
     u16 vertex_sgpr_offset;
     u32 instance_sgpr_offset;
@@ -119,6 +157,9 @@ private:
         return num_new_pipelines > 0;
     }
 
+    /// Returns true if the current draw may be skipped while its pipeline is being compiled.
+    [[nodiscard]] bool CanSkipDrawWhileCompiling() const;
+
 private:
     const Instance& instance;
     Scheduler& scheduler;
@@ -139,6 +180,8 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    std::unique_ptr<PipelineCompileWorkers> compile_workers;
+    bool async_compile{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,
